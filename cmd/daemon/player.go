@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -386,37 +385,16 @@ func (p *AppPlayer) handleApiRequest(ctx context.Context, req ApiRequest) (any, 
 
 		defer func() { _ = resp.Body.Close() }()
 
-		// this is the status we want to return to client not just 500
-		switch resp.StatusCode {
-		case 400:
-			return nil, ErrBadRequest
-		case 403:
-			return nil, ErrForbidden
-		case 404:
-			return nil, ErrNotFound
-		case 405:
-			return nil, ErrMethodNotAllowed
-		case 429:
-			return nil, ErrTooManyRequests
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read web api response body: %w", err)
 		}
 
-		// check for content type if not application/json
-		if !strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
-			respBody, err := io.ReadAll(resp.Body)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read response body: %w", err)
-			}
-
-			return respBody, nil
-		}
-
-		// decode and return json
-		var respJson any
-		if err = json.NewDecoder(resp.Body).Decode(&respJson); err != nil {
-			return nil, fmt.Errorf("failed to decode response body: %w", err)
-		}
-
-		return respJson, nil
+		return &ApiResponseWebApi{
+			StatusCode: resp.StatusCode,
+			Header:     resp.Header,
+			Body:       body,
+		}, nil
 	case ApiRequestTypeStatus:
 		resp := &ApiResponseStatus{
 			Username:       p.sess.Username(),

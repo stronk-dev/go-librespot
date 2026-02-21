@@ -38,6 +38,7 @@ type ConcreteApiServer struct {
 	listener net.Listener
 
 	requests chan ApiRequest
+	devApi   *DevApiTokenProvider
 
 	clients     []*websocket.Conn
 	clientsLock sync.RWMutex
@@ -260,6 +261,14 @@ type ApiResponseToken struct {
 	Token string `json:"token"`
 }
 
+// ApiResponseWebApi is a transparent proxy response from the Spotify Web API.
+// Instead of parsing and re-encoding, the raw response is passed through.
+type ApiResponseWebApi struct {
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+}
+
 type ApiEvent struct {
 	Type ApiEventType `json:"type"`
 	Data any          `json:"data"`
@@ -318,8 +327,8 @@ type ApiEventDataShuffleContext struct {
 	Value bool `json:"value"`
 }
 
-func NewApiServer(log librespot.Logger, address string, port int, allowOrigin string, certFile string, keyFile string) (_ ApiServer, err error) {
-	s := &ConcreteApiServer{log: log, allowOrigin: allowOrigin, certFile: certFile, keyFile: keyFile}
+func NewApiServer(log librespot.Logger, address string, port int, allowOrigin string, certFile string, keyFile string, devApi *DevApiTokenProvider) (_ ApiServer, err error) {
+	s := &ConcreteApiServer{log: log, allowOrigin: allowOrigin, certFile: certFile, keyFile: keyFile, devApi: devApi}
 	s.requests = make(chan ApiRequest)
 
 	s.listener, err = net.Listen("tcp", fmt.Sprintf("%s:%d", address, port))
@@ -382,6 +391,14 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
 	}
 
 	switch respData := resp.data.(type) {
+	case *ApiResponseWebApi:
+		for k, v := range respData.Header {
+			if strings.HasPrefix(k, "Content-") || k == "Retry-After" {
+				w.Header()[k] = v
+			}
+		}
+		w.WriteHeader(respData.StatusCode)
+		_, _ = w.Write(respData.Body)
 	case []byte:
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(respData)
@@ -411,12 +428,34 @@ func (s *ConcreteApiServer) serve() {
 		_, _ = w.Write([]byte("{}"))
 	})
 	m.Handle("/web-api/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimPrefix(r.URL.Path, "/web-api/")
+		query := r.URL.Query()
+
+		// If dev API is authorized, use it directly (separate rate limit bucket).
+		if s.devApi != nil && s.devApi.IsAuthorized() {
+			resp, err := s.devApi.WebApiRequest(r.Context(), r.Method, path, query)
+			if err != nil {
+				s.log.WithError(err).Error("dev API: web request failed, falling back to internal token")
+			} else {
+				defer func() { _ = resp.Body.Close() }()
+				for k, v := range resp.Header {
+					if strings.HasPrefix(k, "Content-") || k == "Retry-After" {
+						w.Header()[k] = v
+					}
+				}
+				w.WriteHeader(resp.StatusCode)
+				_, _ = io.Copy(w, resp.Body)
+				return
+			}
+		}
+
+		// Fall back to internal token via player channel.
 		s.handleRequest(ApiRequest{
 			Type: ApiRequestTypeWebApi,
 			Data: ApiRequestDataWebApi{
 				Method: r.Method,
-				Path:   strings.TrimPrefix(r.URL.Path, "/web-api/"),
-				Query:  r.URL.Query(),
+				Path:   path,
+				Query:  query,
 			},
 		}, w)
 	}))
@@ -607,6 +646,58 @@ func (s *ConcreteApiServer) serve() {
 		}
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeToken}, w)
+	})
+	m.HandleFunc("/devapi/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		configured := s.devApi != nil
+		authorized := configured && s.devApi.IsAuthorized()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"configured": configured,
+			"authorized": authorized,
+		})
+	})
+	m.HandleFunc("/devapi/authorize", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if s.devApi == nil {
+			http.Error(w, "dev API not configured", http.StatusBadRequest)
+			return
+		}
+
+		http.Redirect(w, r, s.devApi.AuthorizeURL(), http.StatusFound)
+	})
+	m.HandleFunc("/devapi/callback", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if s.devApi == nil {
+			http.Error(w, "dev API not configured", http.StatusBadRequest)
+			return
+		}
+
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			errMsg := r.URL.Query().Get("error")
+			http.Error(w, fmt.Sprintf("authorization failed: %s", errMsg), http.StatusBadRequest)
+			return
+		}
+
+		if err := s.devApi.HandleCallback(r.Context(), code); err != nil {
+			s.log.WithError(err).Error("failed handling dev API callback")
+			http.Error(w, "token exchange failed", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html><body><h1>Authorization successful</h1><p>You can close this window. go-librespot will now use your Developer API token for /web-api/ requests.</p></body></html>"))
 	})
 	m.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
 		opts := &websocket.AcceptOptions{}

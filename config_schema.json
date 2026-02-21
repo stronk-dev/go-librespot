@@ -157,6 +157,33 @@
                 "large",
                 "xlarge"
               ]
+            },
+            "dev_api": {
+              "type": "object",
+              "description": "Spotify Developer API credentials for a separate /web-api/ rate limit bucket. Create an app at https://developer.spotify.com/dashboard",
+              "properties": {
+                "client_id": {
+                  "type": "string",
+                  "description": "The Client ID from your Spotify Developer Dashboard app"
+                },
+                "client_secret": {
+                  "type": "string",
+                  "description": "The Client Secret from your Spotify Developer Dashboard app (optional for PKCE-only apps)",
+                  "default": ""
+                },
+                "redirect_uri": {
+                  "type": "string",
+                  "description": "The redirect URI configured in your Spotify app. Defaults to http://{server.address}:{server.port}/devapi/callback",
+                  "default": ""
+                },
+                "scopes": {
+                  "type": "array",
+                  "description": "OAuth2 scopes to request. Defaults to common read/write scopes if not specified.",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
             }
           }
         },

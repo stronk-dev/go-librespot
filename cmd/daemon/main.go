@@ -50,6 +50,7 @@ type App struct {
 	state       librespot.AppState
 
 	server   ApiServer
+	devApi   *DevApiTokenProvider
 	mpris    mpris.Server
 	logoutCh chan *AppPlayer
 }
@@ -115,6 +116,22 @@ func NewApp(cfg *Config) (app *App, err error) {
 		// FLAC decryption keys are available only with the PlayPlay DRM implementation.
 		// Using PlayPlay might get you banned by Spotify.
 		return nil, fmt.Errorf("FLAC playback requires a PlapPlay implementation")
+	}
+
+	// Initialize dev API token provider if configured.
+	if cfg.Server.DevApi.ClientId != "" {
+		devApiCfg := cfg.Server.DevApi
+		if devApiCfg.RedirectUri == "" {
+			devApiCfg.RedirectUri = devApiDefaultRedirectUri(cfg.Server.Address, cfg.Server.Port)
+		}
+		app.devApi = NewDevApiTokenProvider(app.log, devApiCfg, &app.state, app.client)
+
+		if app.devApi.IsAuthorized() {
+			app.log.Infof("dev API: authorized, /web-api/ will use separate token")
+		} else {
+			authURL := app.devApi.AuthorizeURL()
+			app.log.Infof("dev API: not authorized, open this URL to authorize: %s", authURL)
+		}
 	}
 
 	return app, nil
@@ -423,7 +440,8 @@ type Config struct {
 		CertFile    string `koanf:"cert_file"`
 		KeyFile     string `koanf:"key_file"`
 
-		ImageSize string `koanf:"image_size"`
+		ImageSize string       `koanf:"image_size"`
+		DevApi    DevApiConfig `koanf:"dev_api"`
 	} `koanf:"server"`
 	Credentials struct {
 		Type        string `koanf:"type"`
@@ -585,7 +603,7 @@ func main() {
 
 	// create api server if needed
 	if cfg.Server.Enabled {
-		app.server, err = NewApiServer(app.log, cfg.Server.Address, cfg.Server.Port, cfg.Server.AllowOrigin, cfg.Server.CertFile, cfg.Server.KeyFile)
+		app.server, err = NewApiServer(app.log, cfg.Server.Address, cfg.Server.Port, cfg.Server.AllowOrigin, cfg.Server.CertFile, cfg.Server.KeyFile, app.devApi)
 		if err != nil {
 			log.WithError(err).Fatal("failed creating api server")
 		}

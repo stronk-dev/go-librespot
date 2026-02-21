@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 type AppState struct {
@@ -20,7 +21,15 @@ type AppState struct {
 		Username string `json:"username"`
 		Data     []byte `json:"data"`
 	} `json:"credentials"`
-	LastVolume *uint32 `json:"last_volume"`
+	LastVolume  *uint32           `json:"last_volume"`
+	DevApiToken *DevApiTokenState `json:"dev_api_token,omitempty"`
+}
+
+// DevApiTokenState persists the OAuth2 token for the Spotify Developer API.
+type DevApiTokenState struct {
+	RefreshToken string    `json:"refresh_token"`
+	AccessToken  string    `json:"access_token,omitempty"`
+	Expiry       time.Time `json:"expiry,omitempty"`
 }
 
 func (s *AppState) SetLogger(log Logger) {

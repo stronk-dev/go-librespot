@@ -272,3 +272,79 @@ paths:
       responses:
         200:
           description: Successful response
+  /token:
+    post:
+      description: Get a Spotify access token (internal token used by the daemon)
+      responses:
+        200:
+          description: Returns a fresh access token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: The Spotify access token
+  /web-api/{path}:
+    get:
+      description: >
+        Transparent proxy to the Spotify Web API (https://api.spotify.com/).
+        Any path after /web-api/ is forwarded to Spotify. Supports all HTTP methods.
+        When server.dev_api is configured and authorized, requests use a separate
+        OAuth2 token with its own rate limit bucket. Otherwise falls back to the
+        daemon's internal token (shared with playback, may hit rate limits).
+        The response is passed through transparently (status code, headers, body).
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The Spotify Web API path (e.g. v1/me/playlists)
+      responses:
+        200:
+          description: Proxied Spotify API response
+        429:
+          description: Rate limited by Spotify
+  /devapi/status:
+    get:
+      description: Returns the status of the Developer API token provider
+      responses:
+        200:
+          description: Dev API status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  configured:
+                    type: boolean
+                    description: Whether dev API credentials are set in config
+                  authorized:
+                    type: boolean
+                    description: Whether a valid dev API token is available
+  /devapi/authorize:
+    get:
+      description: Redirects to Spotify's OAuth2 authorization page. Open in a browser.
+      responses:
+        302:
+          description: Redirects to Spotify authorization
+        400:
+          description: Dev API not configured
+  /devapi/callback:
+    get:
+      description: OAuth2 callback endpoint (handled automatically by the browser redirect)
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        200:
+          description: Authorization successful (returns HTML confirmation page)
+        400:
+          description: Missing code or authorization error
+        500:
+          description: Token exchange failed
