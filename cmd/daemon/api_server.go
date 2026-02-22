@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +21,13 @@ import (
 	"github.com/rs/cors"
 )
 
-const timeout = 10 * time.Second
+const (
+	timeout                  = 10 * time.Second
+	spotifyIDMinLen          = 21
+	spotifyIDMaxLen          = 22
+	rootlistPageLimitDefault = 50
+	playlistImageSizeDefault = 300
+)
 
 type ApiServer interface {
 	Emit(ev *ApiEvent)
@@ -72,6 +79,19 @@ const (
 	ApiRequestTypeSetShufflingContext ApiRequestType = "shuffling_context"
 	ApiRequestTypeAddToQueue          ApiRequestType = "add_to_queue"
 	ApiRequestTypeToken               ApiRequestType = "token"
+	ApiRequestTypeGetTrack            ApiRequestType = "get_track"
+	ApiRequestTypeGetAlbum            ApiRequestType = "get_album"
+	ApiRequestTypeGetArtist           ApiRequestType = "get_artist"
+	ApiRequestTypeGetShow             ApiRequestType = "get_show"
+	ApiRequestTypeGetEpisode          ApiRequestType = "get_episode"
+	ApiRequestTypeGetPlaylist         ApiRequestType = "get_playlist"
+	ApiRequestTypeGetPlaylistImage    ApiRequestType = "get_playlist_image"
+	ApiRequestTypeGetImage            ApiRequestType = "get_image"
+	ApiRequestTypeGetRootlist         ApiRequestType = "get_rootlist"
+	ApiRequestTypeGetQueue            ApiRequestType = "get_queue"
+	ApiRequestTypeGetContext          ApiRequestType = "get_context"
+	ApiRequestTypeRadio               ApiRequestType = "radio"
+	ApiRequestTypeGetCollection       ApiRequestType = "get_collection"
 )
 
 type ApiEventType string
@@ -90,6 +110,8 @@ const (
 	ApiEventTypeRepeatTrack    ApiEventType = "repeat_track"
 	ApiEventTypeRepeatContext  ApiEventType = "repeat_context"
 	ApiEventTypeShuffleContext ApiEventType = "shuffle_context"
+	ApiEventTypeQueue          ApiEventType = "queue"
+	ApiEventTypeContext        ApiEventType = "context"
 )
 
 type ApiRequest struct {
@@ -125,8 +147,36 @@ type ApiRequestDataPlay struct {
 	Paused    bool   `json:"paused"`
 }
 
+type ApiRequestDataGetMetadata struct {
+	Id        string
+	ImageSize string
+	Limit     int
+	Offset    int
+}
+
+type ApiRequestDataGetRootlist struct {
+	Limit    int
+	Offset   int
+	Paginate bool
+}
+
+type ApiRequestDataGetPlaylistImage struct {
+	Id          string
+	Size        int
+	IfNoneMatch string
+}
+
+type ApiRequestDataGetImage struct {
+	Id          string
+	IfNoneMatch string
+}
+
 type ApiRequestDataNext struct {
 	Uri *string `json:"uri"`
+}
+
+type ApiRequestDataRadio struct {
+	SeedUri string `json:"seed_uri"`
 }
 
 type apiResponse struct {
@@ -135,16 +185,18 @@ type apiResponse struct {
 }
 
 type ApiResponseStatusTrack struct {
-	Uri           string   `json:"uri"`
-	Name          string   `json:"name"`
-	ArtistNames   []string `json:"artist_names"`
-	AlbumName     string   `json:"album_name"`
-	AlbumCoverUrl *string  `json:"album_cover_url"`
-	Position      int64    `json:"position"`
-	Duration      int      `json:"duration"`
-	ReleaseDate   string   `json:"release_date"`
-	TrackNumber   int      `json:"track_number"`
-	DiscNumber    int      `json:"disc_number"`
+	Uri           string           `json:"uri"`
+	Name          string           `json:"name"`
+	ArtistNames   []string         `json:"artist_names"`
+	AlbumName     string           `json:"album_name"`
+	AlbumCoverUrl *string          `json:"album_cover_url"`
+	AlbumUri      string           `json:"album_uri,omitempty"`
+	Artists       []ApiResponseRef `json:"artists,omitempty"`
+	Position      int64            `json:"position"`
+	Duration      int              `json:"duration"`
+	ReleaseDate   string           `json:"release_date"`
+	TrackNumber   int              `json:"track_number"`
+	DiscNumber    int              `json:"disc_number"`
 }
 
 func getBestImageIdForSize(images []*metadatapb.Image, size string) []byte {
@@ -192,47 +244,346 @@ func getBestImageIdForSize(images []*metadatapb.Image, size string) []byte {
 func (p *AppPlayer) newApiResponseStatusTrack(media *librespot.Media, position int64) *ApiResponseStatusTrack {
 	if media.IsTrack() {
 		track := media.Track()
-
-		var artists []string
-		for _, a := range track.Artist {
-			artists = append(artists, *a.Name)
+		if track == nil {
+			return &ApiResponseStatusTrack{Position: position, ArtistNames: []string{}}
 		}
 
-		albumCoverId := getBestImageIdForSize(track.Album.Cover, p.app.cfg.Server.ImageSize)
-		if albumCoverId == nil && track.Album.CoverGroup != nil {
-			albumCoverId = getBestImageIdForSize(track.Album.CoverGroup.Image, p.app.cfg.Server.ImageSize)
+		artistNames := make([]string, 0, len(track.Artist))
+		artistRefs := make([]ApiResponseRef, 0, len(track.Artist))
+		for _, a := range track.Artist {
+			if a == nil {
+				continue
+			}
+			if name := a.GetName(); name != "" {
+				artistNames = append(artistNames, name)
+			}
+			artistRefs = append(artistRefs, artistRef(a))
+		}
+
+		var (
+			albumName     string
+			albumCoverUrl *string
+			albumUri      string
+			releaseDate   string
+		)
+		if track.Album != nil {
+			albumName = track.Album.GetName()
+			albumCoverUrl = p.resolveImageUrl(track.Album.Cover, track.Album.CoverGroup, p.app.cfg.Server.ImageSize)
+			albumUri = spotifyURIFromGID(librespot.SpotifyIdTypeAlbum, track.Album.Gid)
+			if track.Album.Date != nil {
+				releaseDate = track.Album.Date.String()
+			}
 		}
 
 		return &ApiResponseStatusTrack{
-			Uri:           librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeTrack, track.Gid).Uri(),
-			Name:          *track.Name,
-			ArtistNames:   artists,
-			AlbumName:     *track.Album.Name,
-			AlbumCoverUrl: p.prodInfo.ImageUrl(albumCoverId),
+			Uri:           spotifyURIFromGID(librespot.SpotifyIdTypeTrack, track.Gid),
+			Name:          track.GetName(),
+			ArtistNames:   artistNames,
+			AlbumName:     albumName,
+			AlbumCoverUrl: albumCoverUrl,
+			AlbumUri:      albumUri,
+			Artists:       artistRefs,
 			Position:      position,
-			Duration:      int(*track.Duration),
-			ReleaseDate:   track.Album.Date.String(),
-			TrackNumber:   int(*track.Number),
-			DiscNumber:    int(*track.DiscNumber),
+			Duration:      int(track.GetDuration()),
+			ReleaseDate:   releaseDate,
+			TrackNumber:   int(track.GetNumber()),
+			DiscNumber:    int(track.GetDiscNumber()),
 		}
 	} else {
 		episode := media.Episode()
+		if episode == nil {
+			return &ApiResponseStatusTrack{Position: position, ArtistNames: []string{}}
+		}
 
-		albumCoverId := getBestImageIdForSize(episode.CoverImage.Image, p.app.cfg.Server.ImageSize)
+		showName := ""
+		showUri := ""
+		artists := make([]ApiResponseRef, 0, 1)
+		artistNames := make([]string, 0, 1)
+		if episode.Show != nil {
+			showName = episode.Show.GetName()
+			showUri = spotifyURIFromGID(librespot.SpotifyIdTypeShow, episode.Show.Gid)
+			if showName != "" || showUri != "" {
+				artists = append(artists, ApiResponseRef{Uri: showUri, Name: showName})
+			}
+			if showName != "" {
+				artistNames = append(artistNames, showName)
+			}
+		}
 
-		return &ApiResponseStatusTrack{
-			Uri:           librespot.SpotifyIdFromGid(librespot.SpotifyIdTypeEpisode, episode.Gid).Uri(),
-			Name:          *episode.Name,
-			ArtistNames:   []string{*episode.Show.Name},
-			AlbumName:     *episode.Show.Name,
-			AlbumCoverUrl: p.prodInfo.ImageUrl(albumCoverId),
+		resp := &ApiResponseStatusTrack{
+			Uri:           spotifyURIFromGID(librespot.SpotifyIdTypeEpisode, episode.Gid),
+			Name:          episode.GetName(),
+			ArtistNames:   artistNames,
+			AlbumName:     showName,
+			AlbumCoverUrl: p.resolveImageUrl(nil, episode.CoverImage, p.app.cfg.Server.ImageSize),
 			Position:      position,
-			Duration:      int(*episode.Duration),
-			ReleaseDate:   "",
-			TrackNumber:   0,
-			DiscNumber:    0,
+			Duration:      int(episode.GetDuration()),
+		}
+
+		if len(artists) > 0 {
+			resp.Artists = artists
+		}
+
+		return resp
+	}
+}
+
+func (p *AppPlayer) resolveImageUrl(images []*metadatapb.Image, imageGroup *metadatapb.ImageGroup, imageSize string) *string {
+	fileId := getBestImageIdForSize(images, imageSize)
+	if fileId == nil && imageGroup != nil {
+		fileId = getBestImageIdForSize(imageGroup.Image, imageSize)
+	}
+	if fileId == nil {
+		return nil
+	}
+
+	if localPath := localImagePathFromFileID(fileId); localPath != "" {
+		return &localPath
+	}
+	if p.prodInfo == nil {
+		return nil
+	}
+
+	return p.prodInfo.ImageUrl(fileId)
+}
+
+func spotifyURIFromGID(typ librespot.SpotifyIdType, gid []byte) string {
+	if len(gid) != 16 {
+		return ""
+	}
+	return librespot.SpotifyIdFromGid(typ, gid).Uri()
+}
+
+func artistRef(a *metadatapb.Artist) ApiResponseRef {
+	if a == nil {
+		return ApiResponseRef{}
+	}
+	return ApiResponseRef{
+		Uri:  spotifyURIFromGID(librespot.SpotifyIdTypeArtist, a.Gid),
+		Name: a.GetName(),
+	}
+}
+
+func albumRef(a *metadatapb.Album) ApiResponseRef {
+	if a == nil {
+		return ApiResponseRef{}
+	}
+	return ApiResponseRef{
+		Uri:  spotifyURIFromGID(librespot.SpotifyIdTypeAlbum, a.Gid),
+		Name: a.GetName(),
+	}
+}
+
+func (p *AppPlayer) convertTrackProto(track *metadatapb.Track, imageSize string) *ApiResponseTrackFull {
+	if track == nil {
+		return &ApiResponseTrackFull{}
+	}
+
+	artists := make([]ApiResponseRef, 0, len(track.Artist))
+	for _, a := range track.Artist {
+		ref := artistRef(a)
+		if ref.Uri != "" || ref.Name != "" {
+			artists = append(artists, ref)
 		}
 	}
+
+	resp := &ApiResponseTrackFull{
+		Uri:     spotifyURIFromGID(librespot.SpotifyIdTypeTrack, track.Gid),
+		Name:    track.GetName(),
+		Artists: artists,
+	}
+
+	if track.Album != nil {
+		ref := albumRef(track.Album)
+		resp.Album = &ref
+		resp.AlbumCoverUrl = p.resolveImageUrl(track.Album.Cover, track.Album.CoverGroup, imageSize)
+		if track.Album.Date != nil {
+			resp.ReleaseDate = track.Album.Date.String()
+		}
+	}
+
+	resp.Duration = int(track.GetDuration())
+	resp.TrackNumber = int(track.GetNumber())
+	resp.DiscNumber = int(track.GetDiscNumber())
+	resp.Popularity = int(track.GetPopularity())
+	resp.Explicit = track.GetExplicit()
+
+	return resp
+}
+
+func (p *AppPlayer) convertAlbumProto(album *metadatapb.Album, imageSize string) *ApiResponseAlbumFull {
+	if album == nil {
+		return &ApiResponseAlbumFull{}
+	}
+
+	artists := make([]ApiResponseRef, 0, len(album.Artist))
+	for _, a := range album.Artist {
+		ref := artistRef(a)
+		if ref.Uri != "" || ref.Name != "" {
+			artists = append(artists, ref)
+		}
+	}
+
+	resp := &ApiResponseAlbumFull{
+		Uri:      spotifyURIFromGID(librespot.SpotifyIdTypeAlbum, album.Gid),
+		Name:     album.GetName(),
+		Artists:  artists,
+		Label:    album.GetLabel(),
+		CoverUrl: p.resolveImageUrl(album.Cover, album.CoverGroup, imageSize),
+	}
+
+	if album.Type != nil {
+		resp.Type = strings.ToLower(album.Type.String())
+	}
+	if album.Date != nil {
+		resp.ReleaseDate = album.Date.String()
+	}
+	resp.Popularity = int(album.GetPopularity())
+
+	// Flatten disc tracks
+	for _, disc := range album.Disc {
+		if disc == nil {
+			continue
+		}
+		for _, track := range disc.Track {
+			resp.Tracks = append(resp.Tracks, *p.convertTrackProto(track, imageSize))
+		}
+	}
+	resp.TotalTracks = len(resp.Tracks)
+
+	return resp
+}
+
+func (p *AppPlayer) convertArtistProto(artist *metadatapb.Artist, imageSize string, countryCode string) *ApiResponseArtistFull {
+	if artist == nil {
+		return &ApiResponseArtistFull{}
+	}
+
+	resp := &ApiResponseArtistFull{
+		Uri:         spotifyURIFromGID(librespot.SpotifyIdTypeArtist, artist.Gid),
+		Name:        artist.GetName(),
+		PortraitUrl: p.resolveImageUrl(artist.Portrait, artist.PortraitGroup, imageSize),
+	}
+
+	resp.Popularity = int(artist.GetPopularity())
+
+	if len(artist.Biography) > 0 {
+		resp.Biography = artist.Biography[0].GetText()
+	}
+
+	// Top tracks — filter by country code, fall back to first available
+	for _, tt := range artist.TopTrack {
+		if tt != nil && tt.Country != nil && *tt.Country == countryCode {
+			for _, track := range tt.Track {
+				resp.TopTracks = append(resp.TopTracks, *p.convertTrackProto(track, imageSize))
+			}
+			break
+		}
+	}
+	if len(resp.TopTracks) == 0 && len(artist.TopTrack) > 0 {
+		for _, track := range artist.TopTrack[0].Track {
+			resp.TopTracks = append(resp.TopTracks, *p.convertTrackProto(track, imageSize))
+		}
+	}
+
+	// Albums
+	for _, group := range artist.AlbumGroup {
+		if group == nil {
+			continue
+		}
+		for _, a := range group.Album {
+			ref := albumRef(a)
+			if ref.Uri != "" || ref.Name != "" {
+				resp.Albums = append(resp.Albums, ref)
+			}
+		}
+	}
+
+	// Singles
+	for _, group := range artist.SingleGroup {
+		if group == nil {
+			continue
+		}
+		for _, a := range group.Album {
+			ref := albumRef(a)
+			if ref.Uri != "" || ref.Name != "" {
+				resp.Singles = append(resp.Singles, ref)
+			}
+		}
+	}
+
+	// Related artists
+	for _, r := range artist.Related {
+		ref := artistRef(r)
+		if ref.Uri != "" || ref.Name != "" {
+			resp.Related = append(resp.Related, ref)
+		}
+	}
+
+	return resp
+}
+
+func (p *AppPlayer) convertShowProto(show *metadatapb.Show, imageSize string) *ApiResponseShowFull {
+	if show == nil {
+		return &ApiResponseShowFull{}
+	}
+
+	resp := &ApiResponseShowFull{
+		Uri:         spotifyURIFromGID(librespot.SpotifyIdTypeShow, show.Gid),
+		Name:        show.GetName(),
+		Description: show.GetDescription(),
+		Publisher:   show.GetPublisher(),
+		CoverUrl:    p.resolveImageUrl(nil, show.CoverImage, imageSize),
+	}
+
+	if show.MediaType != nil {
+		resp.MediaType = strings.ToLower(show.MediaType.String())
+	}
+
+	for _, ep := range show.Episode {
+		if ep != nil {
+			uri := spotifyURIFromGID(librespot.SpotifyIdTypeEpisode, ep.Gid)
+			if uri == "" {
+				continue
+			}
+			resp.Episodes = append(resp.Episodes, ApiResponseRef{
+				Uri:  uri,
+				Name: ep.GetName(),
+			})
+		}
+	}
+
+	return resp
+}
+
+func (p *AppPlayer) convertEpisodeProto(episode *metadatapb.Episode, imageSize string) *ApiResponseEpisodeFull {
+	if episode == nil {
+		return &ApiResponseEpisodeFull{}
+	}
+
+	resp := &ApiResponseEpisodeFull{
+		Uri:         spotifyURIFromGID(librespot.SpotifyIdTypeEpisode, episode.Gid),
+		Name:        episode.GetName(),
+		Description: episode.GetDescription(),
+		CoverUrl:    p.resolveImageUrl(nil, episode.CoverImage, imageSize),
+		Explicit:    episode.GetExplicit(),
+	}
+
+	resp.Duration = int(episode.GetDuration())
+
+	if episode.Show != nil {
+		ref := ApiResponseRef{
+			Name: episode.Show.GetName(),
+		}
+		ref.Uri = spotifyURIFromGID(librespot.SpotifyIdTypeShow, episode.Show.Gid)
+		resp.Show = &ref
+	}
+
+	if episode.PublishTime != nil {
+		resp.PublishDate = episode.PublishTime.String()
+	}
+
+	return resp
 }
 
 type ApiResponseStatus struct {
@@ -267,6 +618,150 @@ type ApiResponseWebApi struct {
 	StatusCode int
 	Header     http.Header
 	Body       []byte
+}
+
+type ApiResponseBinary struct {
+	StatusCode   int
+	ContentType  string
+	CacheControl string
+	ETag         string
+	Body         []byte
+}
+
+type ApiResponseRef struct {
+	Uri  string `json:"uri"`
+	Name string `json:"name"`
+}
+
+type ApiResponseTrackFull struct {
+	Uri           string           `json:"uri"`
+	Name          string           `json:"name"`
+	Artists       []ApiResponseRef `json:"artists"`
+	Album         *ApiResponseRef  `json:"album,omitempty"`
+	AlbumCoverUrl *string          `json:"album_cover_url,omitempty"`
+	Duration      int              `json:"duration"`
+	TrackNumber   int              `json:"track_number"`
+	DiscNumber    int              `json:"disc_number"`
+	Popularity    int              `json:"popularity"`
+	Explicit      bool             `json:"explicit"`
+	ReleaseDate   string           `json:"release_date,omitempty"`
+}
+
+type ApiResponseAlbumFull struct {
+	Uri         string                 `json:"uri"`
+	Name        string                 `json:"name"`
+	Artists     []ApiResponseRef       `json:"artists"`
+	Type        string                 `json:"type"`
+	Label       string                 `json:"label,omitempty"`
+	ReleaseDate string                 `json:"release_date,omitempty"`
+	CoverUrl    *string                `json:"cover_url,omitempty"`
+	Popularity  int                    `json:"popularity"`
+	TotalTracks int                    `json:"total_tracks"`
+	Tracks      []ApiResponseTrackFull `json:"tracks"`
+}
+
+type ApiResponseArtistFull struct {
+	Uri         string                 `json:"uri"`
+	Name        string                 `json:"name"`
+	PortraitUrl *string                `json:"portrait_url,omitempty"`
+	Popularity  int                    `json:"popularity"`
+	Biography   string                 `json:"biography,omitempty"`
+	TopTracks   []ApiResponseTrackFull `json:"top_tracks"`
+	Albums      []ApiResponseRef       `json:"albums"`
+	Singles     []ApiResponseRef       `json:"singles"`
+	Related     []ApiResponseRef       `json:"related"`
+}
+
+type ApiResponseShowFull struct {
+	Uri         string           `json:"uri"`
+	Name        string           `json:"name"`
+	Description string           `json:"description,omitempty"`
+	Publisher   string           `json:"publisher,omitempty"`
+	CoverUrl    *string          `json:"cover_url,omitempty"`
+	MediaType   string           `json:"media_type,omitempty"`
+	Episodes    []ApiResponseRef `json:"episodes"`
+}
+
+type ApiResponseEpisodeFull struct {
+	Uri         string          `json:"uri"`
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Duration    int             `json:"duration"`
+	CoverUrl    *string         `json:"cover_url,omitempty"`
+	Show        *ApiResponseRef `json:"show,omitempty"`
+	PublishDate string          `json:"publish_date,omitempty"`
+	Explicit    bool            `json:"explicit"`
+}
+
+type ApiResponsePlaylistItem struct {
+	Uri     string `json:"uri"`
+	AddedBy string `json:"added_by,omitempty"`
+	AddedAt int64  `json:"added_at,omitempty"`
+}
+
+type ApiResponsePlaylistFull struct {
+	Uri              string                    `json:"uri"`
+	Name             string                    `json:"name"`
+	Description      string                    `json:"description,omitempty"`
+	OwnerUsername    string                    `json:"owner_username,omitempty"`
+	OwnerDisplayName string                    `json:"owner_display_name,omitempty"`
+	Collaborative    bool                      `json:"collaborative"`
+	TotalTracks      int                       `json:"total_tracks"`
+	ImageUrl         *string                   `json:"image_url,omitempty"`
+	Items            []ApiResponsePlaylistItem `json:"items"`
+}
+
+type ApiResponseRootlistItem struct {
+	Uri  string `json:"uri"`
+	Name string `json:"name,omitempty"`
+}
+
+type ApiResponseRootlist struct {
+	Playlists []ApiResponseRootlistItem `json:"playlists"`
+	Total     *int                      `json:"total,omitempty"`
+	Offset    *int                      `json:"offset,omitempty"`
+	Limit     *int                      `json:"limit,omitempty"`
+}
+
+type ApiResponseCollectionItem struct {
+	Uri string `json:"uri"`
+}
+
+type ApiResponseCollection struct {
+	Items []ApiResponseCollectionItem `json:"items"`
+}
+
+type ApiResponseQueueTrack struct {
+	Uri      string                  `json:"uri"`
+	Name     string                  `json:"name,omitempty"`
+	Provider string                  `json:"provider,omitempty"`
+	Track    *ApiResponseTrackFull   `json:"track,omitempty"`
+	Episode  *ApiResponseEpisodeFull `json:"episode,omitempty"`
+}
+
+type ApiResponseQueue struct {
+	Current    *ApiResponseQueueTrack  `json:"current,omitempty"`
+	PrevTracks []ApiResponseQueueTrack `json:"prev_tracks"`
+	NextTracks []ApiResponseQueueTrack `json:"next_tracks"`
+}
+
+type ApiResponseContextTrack struct {
+	Uri      string            `json:"uri"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+type ApiResponseContext struct {
+	Uri    string                    `json:"uri"`
+	Tracks []ApiResponseContextTrack `json:"tracks"`
+}
+
+type ApiEventDataQueue struct {
+	PrevTracks []ApiResponseQueueTrack `json:"prev_tracks"`
+	NextTracks []ApiResponseQueueTrack `json:"next_tracks"`
+}
+
+type ApiEventDataContext struct {
+	ContextUri string `json:"context_uri"`
 }
 
 type ApiEvent struct {
@@ -399,6 +894,22 @@ func (s *ConcreteApiServer) handleRequest(req ApiRequest, w http.ResponseWriter)
 		}
 		w.WriteHeader(respData.StatusCode)
 		_, _ = w.Write(respData.Body)
+	case *ApiResponseBinary:
+		if respData.ContentType != "" {
+			w.Header().Set("Content-Type", respData.ContentType)
+		}
+		if respData.CacheControl != "" {
+			w.Header().Set("Cache-Control", respData.CacheControl)
+		}
+		if respData.ETag != "" {
+			w.Header().Set("ETag", respData.ETag)
+		}
+		if respData.StatusCode > 0 {
+			w.WriteHeader(respData.StatusCode)
+		}
+		if len(respData.Body) > 0 {
+			_, _ = w.Write(respData.Body)
+		}
 	case []byte:
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(respData)
@@ -419,6 +930,139 @@ func jsonDecode(r *http.Request, v any) error {
 	}
 
 	return json.Unmarshal(data, v)
+}
+
+func parseIntQuery(query url.Values, key string, minValue int) (int, bool) {
+	raw := query.Get(key)
+	if raw == "" {
+		return 0, true
+	}
+
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < minValue {
+		return 0, false
+	}
+
+	return n, true
+}
+
+func isSpotifyBase62ID(id string) bool {
+	if len(id) < spotifyIDMinLen || len(id) > spotifyIDMaxLen {
+		return false
+	}
+
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+
+	return true
+}
+
+func parseMetadataRequest(r *http.Request, pathPrefix string, withPaging bool) (ApiRequestDataGetMetadata, bool) {
+	id := strings.TrimPrefix(r.URL.Path, pathPrefix)
+	if !isSpotifyBase62ID(id) {
+		return ApiRequestDataGetMetadata{}, false
+	}
+
+	data := ApiRequestDataGetMetadata{
+		Id:        id,
+		ImageSize: r.URL.Query().Get("image_size"),
+	}
+
+	if withPaging {
+		limit, ok := parseIntQuery(r.URL.Query(), "limit", 1)
+		if !ok {
+			return ApiRequestDataGetMetadata{}, false
+		}
+		offset, ok := parseIntQuery(r.URL.Query(), "offset", 0)
+		if !ok {
+			return ApiRequestDataGetMetadata{}, false
+		}
+		data.Limit = limit
+		data.Offset = offset
+	}
+
+	return data, true
+}
+
+func parsePlaylistImageRequest(r *http.Request, pathPrefix string) (ApiRequestDataGetPlaylistImage, bool) {
+	raw := strings.TrimPrefix(r.URL.Path, pathPrefix)
+	if !strings.HasSuffix(raw, "/image") {
+		return ApiRequestDataGetPlaylistImage{}, false
+	}
+
+	id := strings.TrimSuffix(raw, "/image")
+	if !isSpotifyBase62ID(id) {
+		return ApiRequestDataGetPlaylistImage{}, false
+	}
+
+	size := playlistImageSizeDefault
+	if rawSize := strings.TrimSpace(r.URL.Query().Get("size")); rawSize != "" {
+		n, err := strconv.Atoi(rawSize)
+		if err != nil {
+			return ApiRequestDataGetPlaylistImage{}, false
+		}
+		switch n {
+		case 60, 300, 640:
+			size = n
+		default:
+			return ApiRequestDataGetPlaylistImage{}, false
+		}
+	}
+
+	return ApiRequestDataGetPlaylistImage{
+		Id:          id,
+		Size:        size,
+		IfNoneMatch: strings.TrimSpace(r.Header.Get("If-None-Match")),
+	}, true
+}
+
+func parseImageProxyRequest(r *http.Request, pathPrefix string) (ApiRequestDataGetImage, bool) {
+	id := strings.TrimPrefix(r.URL.Path, pathPrefix)
+	if !isHexImageID(id) {
+		return ApiRequestDataGetImage{}, false
+	}
+
+	return ApiRequestDataGetImage{
+		Id:          strings.ToLower(id),
+		IfNoneMatch: strings.TrimSpace(r.Header.Get("If-None-Match")),
+	}, true
+}
+
+func parseRootlistRequest(r *http.Request) (ApiRequestDataGetRootlist, bool) {
+	query := r.URL.Query()
+	hasLimit := query.Get("limit") != ""
+	hasOffset := query.Get("offset") != ""
+	if !hasLimit && !hasOffset {
+		return ApiRequestDataGetRootlist{}, true
+	}
+
+	data := ApiRequestDataGetRootlist{
+		Paginate: true,
+		Limit:    rootlistPageLimitDefault,
+	}
+
+	if hasLimit {
+		limit, ok := parseIntQuery(query, "limit", 1)
+		if !ok {
+			return ApiRequestDataGetRootlist{}, false
+		}
+		data.Limit = limit
+	}
+
+	if hasOffset {
+		offset, ok := parseIntQuery(query, "offset", 0)
+		if !ok {
+			return ApiRequestDataGetRootlist{}, false
+		}
+		data.Offset = offset
+	}
+
+	return data, true
 }
 
 func (s *ConcreteApiServer) serve() {
@@ -639,6 +1283,129 @@ func (s *ConcreteApiServer) serve() {
 
 		s.handleRequest(ApiRequest{Type: ApiRequestTypeAddToQueue, Data: data.Uri}, w)
 	})
+	m.HandleFunc("/player/radio", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var data ApiRequestDataRadio
+		if err := jsonDecode(r, &data); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		if len(data.SeedUri) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeRadio, Data: data}, w)
+	})
+	registerMetadataHandler := func(pathPrefix string, reqType ApiRequestType, withPaging bool) {
+		m.Handle(pathPrefix, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+
+			data, ok := parseMetadataRequest(r, pathPrefix, withPaging)
+			if !ok {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			s.handleRequest(ApiRequest{Type: reqType, Data: data}, w)
+		}))
+	}
+
+	registerMetadataHandler("/metadata/track/", ApiRequestTypeGetTrack, false)
+	registerMetadataHandler("/metadata/album/", ApiRequestTypeGetAlbum, false)
+	registerMetadataHandler("/metadata/artist/", ApiRequestTypeGetArtist, false)
+	registerMetadataHandler("/metadata/show/", ApiRequestTypeGetShow, false)
+	registerMetadataHandler("/metadata/episode/", ApiRequestTypeGetEpisode, false)
+	m.Handle("/metadata/playlist/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		if strings.HasSuffix(r.URL.Path, "/image") {
+			data, ok := parsePlaylistImageRequest(r, "/metadata/playlist/")
+			if !ok {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			s.handleRequest(ApiRequest{Type: ApiRequestTypeGetPlaylistImage, Data: data}, w)
+			return
+		}
+
+		data, ok := parseMetadataRequest(r, "/metadata/playlist/", true)
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeGetPlaylist, Data: data}, w)
+	}))
+	m.Handle("/image/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		data, ok := parseImageProxyRequest(r, "/image/")
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeGetImage, Data: data}, w)
+	}))
+	m.HandleFunc("/metadata/rootlist", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		data, ok := parseRootlistRequest(r)
+		if !ok {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeGetRootlist, Data: data}, w)
+	})
+	m.HandleFunc("/metadata/collection", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeGetCollection}, w)
+	})
+	m.HandleFunc("/player/queue", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		s.handleRequest(ApiRequest{Type: ApiRequestTypeGetQueue}, w)
+	})
+	m.Handle("/context/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		uri, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/context/"))
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if len(uri) == 0 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		s.handleRequest(ApiRequest{
+			Type: ApiRequestTypeGetContext,
+			Data: ApiRequestDataGetMetadata{Id: uri},
+		}, w)
+	}))
 	m.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			w.WriteHeader(http.StatusMethodNotAllowed)

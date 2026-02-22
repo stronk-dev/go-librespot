@@ -79,6 +79,16 @@ func (p *AppPlayer) schedulePrefetchNext() {
 	}
 }
 
+func (p *AppPlayer) emitQueueEvent() {
+	prev := queueTracksFromProvidedTracks(p.state.player.PrevTracks)
+	next := queueTracksFromProvidedTracks(p.state.player.NextTracks)
+
+	p.app.server.Emit(&ApiEvent{
+		Type: ApiEventTypeQueue,
+		Data: ApiEventDataQueue{PrevTracks: prev, NextTracks: next},
+	})
+}
+
 func (p *AppPlayer) emitMprisUpdate(playbackStatus mpris.PlaybackStatus) {
 	// p.state, p.state.player, p.state.device, p.state.player.Options are assumed to always be non-nil here
 
@@ -295,6 +305,11 @@ func (p *AppPlayer) loadContext(ctx context.Context, spotCtx *connectpb.Context,
 		return fmt.Errorf("failed loading current track (load context): %w", err)
 	}
 
+	p.app.server.Emit(&ApiEvent{
+		Type: ApiEventTypeContext,
+		Data: ApiEventDataContext{ContextUri: spotCtx.Uri},
+	})
+
 	return nil
 }
 
@@ -447,6 +462,7 @@ func (p *AppPlayer) addToQueue(ctx context.Context, track *connectpb.ContextTrac
 	p.state.player.NextTracks = p.state.tracks.NextTracks(ctx, nil)
 	p.updateState(ctx)
 	p.schedulePrefetchNext()
+	p.emitQueueEvent()
 }
 
 func (p *AppPlayer) setQueue(ctx context.Context, prev []*connectpb.ContextTrack, next []*connectpb.ContextTrack) {
@@ -460,6 +476,7 @@ func (p *AppPlayer) setQueue(ctx context.Context, prev []*connectpb.ContextTrack
 	p.state.player.NextTracks = p.state.tracks.NextTracks(ctx, next)
 	p.updateState(ctx)
 	p.schedulePrefetchNext()
+	p.emitQueueEvent()
 }
 
 func (p *AppPlayer) play(ctx context.Context) error {

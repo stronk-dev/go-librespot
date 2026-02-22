@@ -139,11 +139,14 @@ func NewApp(cfg *Config) (app *App, err error) {
 
 func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err error) {
 	appPlayer := &AppPlayer{
-		app:          app,
-		stop:         make(chan struct{}, 1),
-		logout:       app.logoutCh,
-		countryCode:  new(string),
-		volumeUpdate: make(chan float32, 1),
+		app:                app,
+		stop:               make(chan struct{}, 1),
+		logout:             app.logoutCh,
+		countryCode:        new(string),
+		volumeUpdate:       make(chan float32, 1),
+		playlistImageCache: make(map[string]playlistImageCacheEntry),
+		imageProxyCache:    make(map[string]imageProxyCacheEntry),
+		apiResponseCache:   make(map[string]apiResponseCacheEntry),
 	}
 
 	appPlayer.prefetchTimer = time.NewTimer(math.MaxInt64)

@@ -6,6 +6,16 @@ info:
 
 components:
   schemas:
+    ref:
+      description: A lightweight reference to a Spotify entity
+      type: object
+      properties:
+        uri:
+          description: Spotify URI
+          type: string
+        name:
+          description: Display name
+          type: string
     track:
       description: A track
       type: object
@@ -26,8 +36,16 @@ components:
           description: Album name
           type: string
         album_cover_url:
-          description: Album cover URL
+          description: Album cover URL, usually a local daemon path like /image/{hexid}
           type: string
+        album_uri:
+          description: Album URI (for browsing)
+          type: string
+        artists:
+          description: Structured artist references with URIs
+          type: array
+          items:
+            $ref: '#/components/schemas/ref'
         duration:
           description: Duration in milliseconds
           type: integer
@@ -272,6 +290,44 @@ paths:
       responses:
         200:
           description: Successful response
+  /player/radio:
+    post:
+      description: Start radio/station playback from a seed URI (track, artist, etc.)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ seed_uri ]
+              properties:
+                seed_uri:
+                  description: The seed URI to generate radio from (e.g. spotify:track:xxx)
+                  type: string
+      responses:
+        200:
+          description: Radio playback started
+        204:
+          description: No active session
+  /metadata/collection:
+    get:
+      description: Get the current user's Liked Songs (collection) via internal API
+      responses:
+        200:
+          description: List of liked tracks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        uri:
+                          type: string
+        204:
+          description: No active session
   /token:
     post:
       description: Get a Spotify access token (internal token used by the daemon)
@@ -348,3 +404,465 @@ paths:
           description: Missing code or authorization error
         500:
           description: Token exchange failed
+  /metadata/track/{id}:
+    get:
+      description: Get track metadata via Spotify's internal API (no Web API rate limits)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9]{21,22}$'
+            minLength: 21
+            maxLength: 22
+          description: Base62 Spotify track ID (21-22 characters)
+        - name: image_size
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [default, small, large, xlarge]
+          description: Override album cover image size
+      responses:
+        200:
+          description: Track metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uri:
+                    type: string
+                  name:
+                    type: string
+                  artists:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ref'
+                  album:
+                    $ref: '#/components/schemas/ref'
+                  album_cover_url:
+                    type: string
+                    description: Usually a local daemon path like /image/{hexid}
+                  duration:
+                    type: integer
+                  track_number:
+                    type: integer
+                  disc_number:
+                    type: integer
+                  popularity:
+                    type: integer
+                  explicit:
+                    type: boolean
+                  release_date:
+                    type: string
+        204:
+          description: No active session
+        400:
+          description: Invalid metadata ID
+  /metadata/album/{id}:
+    get:
+      description: Get album metadata with track listing via internal API
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9]{21,22}$'
+            minLength: 21
+            maxLength: 22
+          description: Base62 Spotify album ID
+        - name: image_size
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        200:
+          description: Album metadata with tracks
+        204:
+          description: No active session
+        400:
+          description: Invalid metadata ID
+  /metadata/artist/{id}:
+    get:
+      description: Get artist metadata (top tracks, albums, bio) via internal API
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9]{21,22}$'
+            minLength: 21
+            maxLength: 22
+          description: Base62 Spotify artist ID
+        - name: image_size
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        200:
+          description: Artist metadata
+        204:
+          description: No active session
+        400:
+          description: Invalid metadata ID
+  /metadata/show/{id}:
+    get:
+      description: Get podcast/show metadata via internal API
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9]{21,22}$'
+            minLength: 21
+            maxLength: 22
+          description: Base62 Spotify show ID
+        - name: image_size
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        200:
+          description: Show metadata
+        204:
+          description: No active session
+        400:
+          description: Invalid metadata ID
+  /metadata/episode/{id}:
+    get:
+      description: Get episode metadata via internal API
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9]{21,22}$'
+            minLength: 21
+            maxLength: 22
+          description: Base62 Spotify episode ID
+        - name: image_size
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        200:
+          description: Episode metadata
+        204:
+          description: No active session
+        400:
+          description: Invalid metadata ID
+  /metadata/playlist/{id}:
+    get:
+      description: >
+        Get playlist metadata and track list via internal API.
+        Includes image_url (playlist cover), owner_username, and owner_display_name when resolvable.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9]{21,22}$'
+            minLength: 21
+            maxLength: 22
+          description: Base62 Spotify playlist ID
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+          description: Maximum number of items to return
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          description: Number of items to skip
+        - name: image_size
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        200:
+          description: Playlist metadata with items
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uri:
+                    type: string
+                  name:
+                    type: string
+                  description:
+                    type: string
+                  owner_username:
+                    type: string
+                  owner_display_name:
+                    type: string
+                  collaborative:
+                    type: boolean
+                  total_tracks:
+                    type: integer
+                  image_url:
+                    type: string
+                    description: >
+                      Playlist artwork URL. Usually a local daemon path (/image/{hexid})
+                      or a local generated endpoint (/metadata/playlist/{id}/image?...).
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        uri:
+                          type: string
+                        added_by:
+                          type: string
+                        added_at:
+                          type: integer
+        204:
+          description: No active session
+        403:
+          description: Forbidden
+        429:
+          description: Rate limited upstream
+        400:
+          description: Invalid metadata ID or invalid limit/offset
+  /metadata/playlist/{id}/image:
+    get:
+      description: >
+        Get generated playlist mosaic artwork (JPEG) for playlists without explicit custom cover.
+        Supports conditional GET with ETag.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9]{21,22}$'
+            minLength: 21
+            maxLength: 22
+          description: Base62 Spotify playlist ID
+        - name: size
+          in: query
+          required: false
+          schema:
+            type: integer
+            enum: [60, 300, 640]
+          description: Desired output image size in pixels (default 300)
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Conditional request ETag
+      responses:
+        200:
+          description: JPEG image bytes
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+        304:
+          description: Not modified
+        204:
+          description: No active session
+        403:
+          description: Forbidden
+        429:
+          description: Rate limited upstream
+        400:
+          description: Invalid metadata ID or unsupported size
+        404:
+          description: Playlist or generated artwork not found
+  /image/{id}:
+    get:
+      description: >
+        Serve image bytes for a Spotify image ID via the daemon-local cache/proxy.
+        Supports conditional GET with ETag.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Fa-f0-9]{40}$'
+            minLength: 40
+            maxLength: 40
+          description: Spotify image ID (40-char hex)
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Conditional request ETag
+      responses:
+        200:
+          description: Image bytes
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+        304:
+          description: Not modified
+        204:
+          description: No active session
+        400:
+          description: Invalid image ID
+        403:
+          description: Forbidden
+        404:
+          description: Image not found
+        429:
+          description: Rate limited upstream
+  /metadata/rootlist:
+    get:
+      description: Get the current user's playlist collection via internal API
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+          description: Maximum number of playlists to return
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+          description: Number of playlists to skip
+      responses:
+        200:
+          description: List of user's playlists
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total:
+                    type: integer
+                  offset:
+                    type: integer
+                  limit:
+                    type: integer
+                  playlists:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        uri:
+                          type: string
+                        name:
+                          type: string
+        204:
+          description: No active session
+        400:
+          description: Invalid limit/offset query parameters
+  /player/queue:
+    get:
+      description: Get the current playback queue
+      responses:
+        200:
+          description: Current queue state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  current:
+                    type: object
+                    properties:
+                      uri:
+                        type: string
+                      name:
+                        type: string
+                      provider:
+                        type: string
+                      track:
+                        type: object
+                        description: >
+                          Enriched track metadata for track URIs (same shape as /metadata/track/{id}).
+                      episode:
+                        type: object
+                        description: >
+                          Enriched episode metadata for episode URIs (same shape as /metadata/episode/{id}).
+                  prev_tracks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        uri:
+                          type: string
+                        name:
+                          type: string
+                        provider:
+                          type: string
+                        track:
+                          type: object
+                          description: >
+                            Enriched track metadata for track URIs (same shape as /metadata/track/{id}).
+                        episode:
+                          type: object
+                          description: >
+                            Enriched episode metadata for episode URIs (same shape as /metadata/episode/{id}).
+                  next_tracks:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        uri:
+                          type: string
+                        name:
+                          type: string
+                        provider:
+                          type: string
+                        track:
+                          type: object
+                          description: >
+                            Enriched track metadata for track URIs (same shape as /metadata/track/{id}).
+                        episode:
+                          type: object
+                          description: >
+                            Enriched episode metadata for episode URIs (same shape as /metadata/episode/{id}).
+        204:
+          description: No active session
+  /context/{uri}:
+    get:
+      description: >
+        Resolve any Spotify URI to its track list via internal context-resolve API.
+        Works with playlists, albums, artist URIs, stations, etc.
+      parameters:
+        - name: uri
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Full Spotify URI (e.g. spotify:album:xxx), URL-escaped when needed
+      responses:
+        200:
+          description: Resolved context with track list
+        204:
+          description: No active session
+        400:
+          description: Invalid or malformed context URI in path

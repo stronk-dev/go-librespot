@@ -53,6 +53,7 @@ func (c *Client) recvLoop() {
 
 	seq := uint64(0)
 	reqs := map[uint64]hermesRequest{}
+	partials := map[uint64][][]byte{}
 
 	for {
 		select {
@@ -61,7 +62,7 @@ func (c *Client) recvLoop() {
 			return
 		case pkt := <-ch:
 			if pkt.Type != ap.PacketTypeMercuryReq {
-				c.log.Warnf("skipping mercury packet with type: %s", pkt.Type.String())
+				c.log.Debugf("skipping mercury packet with type: %s", pkt.Type.String())
 				continue
 			}
 
@@ -90,21 +91,8 @@ func (c *Client) recvLoop() {
 			var flags uint8
 			_ = binary.Read(resp, binary.BigEndian, &flags)
 
-			if flags != 1 {
-				c.log.Warnf("received unsupported partial mercury response: %d", flags)
-				continue
-			}
-
 			var partsCount uint16
 			_ = binary.Read(resp, binary.BigEndian, &partsCount)
-
-			req, ok := reqs[respSeq]
-			if !ok {
-				c.log.Warnf("received mercury response with invalid sequence: %d", respSeq)
-				continue
-			}
-
-			delete(reqs, respSeq)
 
 			parts := make([][]byte, partsCount)
 			for i := uint16(0); i < partsCount; i++ {
@@ -115,6 +103,30 @@ func (c *Client) recvLoop() {
 				_, _ = resp.Read(part)
 				parts[i] = part
 			}
+
+			req, ok := reqs[respSeq]
+			if !ok {
+				delete(partials, respSeq)
+				c.log.Debugf("ignoring mercury response for unknown sequence: seq=%d flags=%d", respSeq, flags)
+				continue
+			}
+
+			switch flags {
+			case 0:
+				partials[respSeq] = append(partials[respSeq], parts...)
+				continue
+			case 1:
+				parts = append(partials[respSeq], parts...)
+				delete(partials, respSeq)
+			case 2:
+				parts = append(partials[respSeq], parts...)
+				delete(partials, respSeq)
+			default:
+				c.log.Warnf("received unsupported partial mercury response: %d", flags)
+				continue
+			}
+
+			delete(reqs, respSeq)
 
 			if len(parts) == 0 {
 				req.resp <- hermesResponse{err: fmt.Errorf("received empty mercury response")}
@@ -196,6 +208,10 @@ func (c *Client) Request(ctx context.Context, method, uri string, fields map[str
 	case resp := <-req.resp:
 		if resp.err != nil {
 			return nil, resp.err
+		}
+
+		if resp.header == nil || resp.header.StatusCode == nil {
+			return nil, fmt.Errorf("mercury request missing status code in response header")
 		}
 
 		if *resp.header.StatusCode != 200 {
